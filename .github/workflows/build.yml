@@ -1,0 +1,472 @@
+name: Build APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p proj
+          cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'TCEOF0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.tradecopilot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.tradecopilot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          TCEOF0
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'TCEOF1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application android:label="Trading Copilot" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          TCEOF1
+          mkdir -p app/src/main/java/com/tradecopilot
+          cat > app/src/main/java/com/tradecopilot/Analyzer.kt <<'TCEOF2'
+          package com.tradecopilot
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Analyzer {
+              // Fallback order: pehla model fail/limit ho to agla try hota hai
+              val MODELS = listOf("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite")
+              private val blockedUntil = HashMap<String, Long>()
+
+              class ApiErr(val code: Int, msg: String) : Exception(msg)
+
+              val SYSTEM = """
+          You are a senior prop-desk trader and technical analyst (20+ years: price action, Wyckoff, smart-money/liquidity, volume, options basics). You get a screenshot of a LIVE phone trading screen. Ignore any small floating 'Trading Copilot' overlay.
+          PROCESS (silently): 1) Identify instrument, timeframe, price, indicators. 2) Market structure: trend (HH/HL, LH/LL), BOS/CHoCH, range vs trend, phase. 3) Key levels: support/resistance, supply/demand, VWAP, EMAs, previous day high/low, liquidity pools. 4) Candles and patterns: engulfing, pin bar, hammer, doji, inside bar, flags, triangles, double top/bottom, breakout and retest, fake breakouts. 5) Volume and indicators: RSI/MACD divergence, EMA slope, Bollinger squeeze, Supertrend.
+          CONFLUENCE SCORE out of 10: +2 trend alignment, +2 at key level, +2 candle/pattern confirmation, +1 volume, +1 indicator agreement, +1 room to target at least 1:2, +1 clean structure. Confidence = score*10 minus 10 for each: counter-trend, spike/news candle, choppy range, far stop, unclear screen.
+          RULES: BUY or SELL only if score >= 7, risk:reward >= 1:1.5, not against the trend, entry near a level (no chasing). Otherwise WAIT and state exactly what must happen to trigger. Never trade the middle of a range. Stop-loss beyond structure, target at the next real level. Read prices from the price axis; if unreadable say so. If an open trade was suggested before and is still valid, say HOLD and when to trail stop to breakeven. If the screen is not a chart, return WAIT. Be calibrated; never promise profit.
+          Reply ONLY with JSON, no markdown:
+          {"signal":"BUY|SELL|WAIT","confidence":0-100,"instrument":"","timeframe":"","price":"","trend":"Uptrend|Downtrend|Sideways","entry":"","stop_loss":"","target":"","risk_reward":"","past":"what happened recently on the chart, 1-2 short lines","now":"what is happening right now and why, 1-2 short lines","next":"what is likely to happen next: bullish case and bearish case with levels","action":"exactly what to do now (buy/sell/wait/hold/exit) in one line","voice":"2-3 short Hindi sentences in Devanagari covering what is happening, what to do now (khareedo/becho/ruko) and what may come next"}
+          Write past/now/next/action in simple Hinglish (Roman Hindi).
+          """.trimIndent()
+
+              fun analyze(key: String, b64: String, ctx: String): JSONObject {
+                  var lastErr = "koi model available nahi"
+                  for (m in MODELS) {
+                      if ((blockedUntil[m] ?: 0L) > System.currentTimeMillis()) continue
+                      try {
+                          val j = call(m, key, b64, ctx)
+                          j.put("_model", m)
+                          return j
+                      } catch (e: ApiErr) {
+                          val body = e.message ?: ""
+                          if (e.code == 401 || e.code == 403 || (e.code == 400 && body.contains("API key", true)))
+                              throw Exception("API key galat/band hai (" + e.code + "). Nayi key banao.")
+                          val wait = when {
+                              e.code == 429 && (body.contains("PerDay", true) || body.contains("daily", true)) -> 3600_000L
+                              e.code == 429 -> 90_000L
+                              e.code == 404 -> 24 * 3600_000L
+                              else -> 30_000L
+                          }
+                          blockedUntil[m] = System.currentTimeMillis() + wait
+                          lastErr = m + ": " + e.code
+                      } catch (e: java.io.IOException) {
+                          lastErr = m + ": network " + (e.message ?: "")
+                      } catch (e: Exception) {
+                          lastErr = m + ": " + (e.message ?: "")
+                      }
+                  }
+                  throw Exception("Sab models ki limit/error. Thodi der baad khud chalega. (" + lastErr + ")")
+              }
+
+              private fun call(model: String, key: String, b64: String, ctx: String): JSONObject {
+                  val parts = JSONArray()
+                      .put(JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64)))
+                      .put(JSONObject().put("text", ctx))
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+                      .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
+                      .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("maxOutputTokens", 2000).put("temperature", 0.3))
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 60000; c.doOutput = true
+                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val code = c.responseCode
+                  val resp = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (code !in 200..299) throw ApiErr(code, resp.take(400))
+                  val out = JSONObject(resp).getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                  val a = out.indexOf('{'); val e = out.lastIndexOf('}')
+                  if (a < 0 || e < a) throw Exception("Reply samajh nahi aaya")
+                  return JSONObject(out.substring(a, e + 1))
+              }
+          }
+          TCEOF2
+          mkdir -p app/src/main/java/com/tradecopilot
+          cat > app/src/main/java/com/tradecopilot/CaptureService.kt <<'TCEOF3'
+          package com.tradecopilot
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.tts.TextToSpeech
+          import android.util.Base64
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.TextView
+          import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
+          import java.util.Locale
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class CaptureService : Service() {
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var vd: VirtualDisplay? = null
+              private val bg = Executors.newSingleThreadExecutor()
+              private val main = Handler(Looper.getMainLooper())
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var wm: WindowManager? = null
+              private var bubble: TextView? = null
+              private lateinit var lp: WindowManager.LayoutParams
+              private var busy = false
+              private var running = false
+              private var expanded = false
+              private var lastB64: String? = null
+              private var last: JSONObject? = null
+              private var lastSig = ""
+              private var w = 0
+              private var h = 0
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i == null || i.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  startFg()
+                  @Suppress("DEPRECATION")
+                  val data = i.getParcelableExtra<Intent>("data")
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(i.getIntExtra("code", 0), data!!)
+                  projection!!.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopSelf() }
+                  }, main)
+                  val dm = resources.displayMetrics
+                  val scale = minOf(1.0, 1400.0 / maxOf(dm.widthPixels, dm.heightPixels))
+                  w = (dm.widthPixels * scale).toInt(); h = (dm.heightPixels * scale).toInt()
+                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  vd = projection!!.createVirtualDisplay("tc", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null)
+                  tts = TextToSpeech(this) { s ->
+                      if (s == TextToSpeech.SUCCESS) { tts?.language = Locale("hi", "IN"); ttsReady = true }
+                  }
+                  addBubble()
+                  running = true
+                  main.postDelayed(tick, 2500)
+                  return START_NOT_STICKY
+              }
+
+              private fun prefs() = getSharedPreferences("tc", MODE_PRIVATE)
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      analyzeOnce()
+                      main.postDelayed(this, prefs().getInt("every", 15) * 1000L)
+                  }
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("tc", "Trading Copilot", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 1, Intent(this, CaptureService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "tc").setContentTitle("Trading Copilot chal raha hai")
+                      .setContentText("Screen dekh raha hai. Band karne ke liye Stop dabao.")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .addAction(Notification.Action.Builder(null, "Stop", stop).build()).build()
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+              }
+
+              private fun addBubble() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val tv = TextView(this)
+                  tv.setTextColor(Color.WHITE); tv.textSize = 13f; tv.setPadding(28, 18, 28, 18)
+                  tv.background = GradientDrawable().apply { setColor(0xEE1B2430.toInt()); cornerRadius = 30f; setStroke(4, 0xFF5B8CFF.toInt()) }
+                  tv.text = "🔍 Chart dekh raha hoon…"
+                  lp = WindowManager.LayoutParams(
+                      (resources.displayMetrics.widthPixels * 0.72).toInt(), WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START; lp.x = 24; lp.y = 160
+                  var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+                  tv.setOnTouchListener { v, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y; moved = false; true }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - sx).toInt(); val dy = (e.rawY - sy).toInt()
+                              if (abs(dx) + abs(dy) > 12) moved = true
+                              lp.x = ox + dx; lp.y = oy + dy; wm?.updateViewLayout(v, lp); true
+                          }
+                          MotionEvent.ACTION_UP -> { if (!moved) { expanded = !expanded; refresh() }; true }
+                          else -> false
+                      }
+                  }
+                  bubble = tv
+                  wm!!.addView(tv, lp)
+              }
+
+              private fun grab(): String? {
+                  val img = reader?.acquireLatestImage() ?: return null
+                  try {
+                      val p = img.planes[0]
+                      val pad = p.rowStride - p.pixelStride * w
+                      val bmp = Bitmap.createBitmap(w + pad / p.pixelStride, h, Bitmap.Config.ARGB_8888)
+                      bmp.copyPixelsFromBuffer(p.buffer)
+                      val crop = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                      val bo = ByteArrayOutputStream()
+                      crop.compress(Bitmap.CompressFormat.JPEG, 80, bo)
+                      return Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP)
+                  } finally { img.close() }
+              }
+
+              private fun analyzeOnce() {
+                  if (busy) return
+                  val b64 = grab() ?: lastB64 ?: return
+                  lastB64 = b64; busy = true
+                  val p = prefs()
+                  val ctx = "Market: ${p.getString("market", "")}. Style: ${p.getString("style", "")}. Risk: ${p.getString("risk", "")}. " +
+                      "Previous signal: ${lastSig.ifEmpty { "none" }}. Analyse this live screenshot now."
+                  bg.execute {
+                      try {
+                          val j = Analyzer.analyze(p.getString("key", "") ?: "", b64, ctx)
+                          main.post { render(j) }
+                      } catch (e: Exception) {
+                          main.post { bubble?.text = "⚠️ ${e.message}" }
+                      } finally { busy = false }
+                  }
+              }
+
+              private fun render(j: JSONObject) {
+                  var sig = j.optString("signal", "WAIT").uppercase()
+                  var voice = j.optString("voice")
+                  if (sig != "WAIT" && j.optInt("confidence", 0) < prefs().getInt("minc", 70)) {
+                      sig = "WAIT"; voice = "रुकिए, अभी साफ़ सेटअप नहीं है"
+                      j.put("action", "Setup weak hai, WAIT karo. " + j.optString("action"))
+                  }
+                  j.put("signal", sig)
+                  last = j
+                  refresh()
+                  val changed = sig != lastSig
+                  lastSig = sig
+                  if (ttsReady && voice.isNotEmpty() && (changed || prefs().getBoolean("talkAll", true))) {
+                      tts?.speak(voice, TextToSpeech.QUEUE_FLUSH, null, "tc")
+                  }
+              }
+
+              private fun refresh() {
+                  val j = last ?: return
+                  val sig = j.optString("signal")
+                  val em = when (sig) { "BUY" -> "🟢"; "SELL" -> "🔴"; else -> "🟡" }
+                  var t = "$em $sig  ${j.optInt("confidence")}%  ${j.optString("price")}\n" +
+                      "E ${j.optString("entry")}  SL ${j.optString("stop_loss")}  T ${j.optString("target")}\n👉 ${j.optString("action")}"
+                  if (expanded) t += "\n\n⏪ ${j.optString("past")}\n▶️ ${j.optString("now")}\n⏩ ${j.optString("next")}\nRR ${j.optString("risk_reward")} | ${j.optString("trend")}\n🤖 ${j.optString("_model")}"
+                  else t += "\n(tap: poora analysis)"
+                  bubble?.text = t
+                  (bubble?.background as? GradientDrawable)?.setStroke(5,
+                      when (sig) { "BUY" -> 0xFF2ECC83.toInt(); "SELL" -> 0xFFFF5C6A.toInt(); else -> 0xFFF0B429.toInt() })
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  main.removeCallbacksAndMessages(null)
+                  try { vd?.release() } catch (_: Exception) {}
+                  try { reader?.close() } catch (_: Exception) {}
+                  try { projection?.stop() } catch (_: Exception) {}
+                  try { bubble?.let { wm?.removeView(it) } } catch (_: Exception) {}
+                  tts?.shutdown(); bg.shutdownNow()
+                  super.onDestroy()
+              }
+          }
+          TCEOF3
+          mkdir -p app/src/main/java/com/tradecopilot
+          cat > app/src/main/java/com/tradecopilot/MainActivity.kt <<'TCEOF4'
+          package com.tradecopilot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var p: SharedPreferences
+              private lateinit var key: EditText
+              private lateinit var market: Spinner
+              private lateinit var style: Spinner
+              private lateinit var risk: Spinner
+              private lateinit var every: Spinner
+              private lateinit var minc: Spinner
+              private lateinit var talk: Switch
+              private lateinit var status: TextView
+
+              private fun spinner(items: List<String>, saved: String?): Spinner {
+                  val s = Spinner(this)
+                  s.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, items)
+                  val i = items.indexOf(saved); if (i >= 0) s.setSelection(i)
+                  return s
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  p = getSharedPreferences("tc", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(44, 110, 44, 60) }
+                  fun label(t: String) = TextView(this).apply { text = t; textSize = 12f; setPadding(0, 30, 0, 6); alpha = 0.7f }
+                  root.addView(TextView(this).apply { text = "📈 Trading Copilot"; textSize = 26f })
+                  root.addView(TextView(this).apply { text = "Apni trading app ki screen live dekhta hai, background mein bolke batata hai."; alpha = 0.7f })
+
+                  root.addView(label("Gemini API key"))
+                  key = EditText(this).apply { inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; setText(p.getString("key", "")); hint = "AIza... / AQ..." }
+                  root.addView(key)
+                  root.addView(label("Market"))
+                  market = spinner(listOf("Stocks / Nifty / BankNifty", "Options (CE/PE)", "Forex", "Crypto", "Commodity"), p.getString("market", null)); root.addView(market)
+                  root.addView(label("Trading style"))
+                  style = spinner(listOf("Scalping (1-5 min)", "Intraday (5-15 min)", "Swing (1H-1D)"), p.getString("style", "Intraday (5-15 min)")); root.addView(style)
+                  root.addView(label("Risk"))
+                  risk = spinner(listOf("Low", "Medium", "High"), p.getString("risk", "Medium")); root.addView(risk)
+                  root.addView(label("Check har (seconds)  - kam = zyada API kharcha"))
+                  every = spinner(listOf("10", "15", "30", "60"), p.getInt("every", 15).toString()); root.addView(every)
+                  root.addView(label("Signal filter: sirf itni confidence ke upar BUY/SELL"))
+                  minc = spinner(listOf("60", "70", "80"), p.getInt("minc", 70).toString()); root.addView(minc)
+                  talk = Switch(this).apply { text = "Har update par bolo (off = sirf signal badalne par)"; isChecked = p.getBoolean("talkAll", true); setPadding(0, 30, 0, 0) }
+                  root.addView(talk)
+
+                  val start = Button(this).apply { text = "▶ START (screen share + floating assistant)"; setOnClickListener { begin() } }
+                  val stop = Button(this).apply { text = "⏹ STOP"; setOnClickListener { stopService(Intent(this@MainActivity, CaptureService::class.java)); status.text = "Stopped." } }
+                  root.addView(start); root.addView(stop)
+                  status = TextView(this).apply { text = "Start dabao, permission do, phir apni trading app kholo. Floating box signal dikhayega."; setPadding(0, 24, 0, 0); alpha = 0.8f }
+                  root.addView(status)
+                  root.addView(TextView(this).apply {
+                      text = "\n⚠️ Sirf decision-support hai, financial advice nahi. AI galat ho sakta hai. Stop-loss lagao, pehle paper trading karo."
+                      textSize = 11f; alpha = 0.6f })
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              private fun save() {
+                  p.edit().putString("key", key.text.toString().trim())
+                      .putString("market", market.selectedItem.toString()).putString("style", style.selectedItem.toString())
+                      .putString("risk", risk.selectedItem.toString()).putInt("every", every.selectedItem.toString().toInt())
+                      .putInt("minc", minc.selectedItem.toString().toInt()).putBoolean("talkAll", talk.isChecked).apply()
+              }
+
+              private fun begin() {
+                  save()
+                  if (p.getString("key", "").isNullOrEmpty()) { Toast.makeText(this, "Pehle API key daalo", Toast.LENGTH_LONG).show(); return }
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Is app ko 'Display over other apps' allow karo, phir wapas aake Start dabao", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION") startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      startForegroundService(Intent(this, CaptureService::class.java).putExtra("code", res).putExtra("data", data))
+                      status.text = "✅ Chal raha hai. Ab apni trading app kholo."
+                      moveTaskToBack(true)
+                  } else status.text = "Screen share permission nahi mili."
+              }
+          }
+          TCEOF4
+          :
+          cat > build.gradle.kts <<'TCEOF5'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          TCEOF5
+          :
+          cat > gradle.properties <<'TCEOF6'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          TCEOF6
+          :
+          cat > settings.gradle.kts <<'TCEOF7'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TradingCopilot"
+          include(":app")
+          TCEOF7
+      - name: Build APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Trading Copilot APK ${{ github.run_number }}
+          files: proj/app/build/outputs/apk/debug/app-debug.apk
